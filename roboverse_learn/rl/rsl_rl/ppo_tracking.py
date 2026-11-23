@@ -18,7 +18,7 @@ rootutils.setup_root(__file__, pythonpath=True)
 
 from metasim.task.registry import get_task_class
 from roboverse_learn.rl.configs.rsl_rl.ppo_tracking import RslRlPPOTrackingConfig
-from roboverse_learn.rl.rsl_rl.env_wrapper import RslRlEnvWrapper
+from roboverse_learn.rl.rsl_rl.env_wrapper import RslRlEnvWrapper, export_policy_jit
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -82,9 +82,7 @@ def train(args: RslRlPPOTrackingConfig):
 
     # Export policy
     print("Exporting policy...")
-    policy = runner.get_inference_policy()
-    policy_path = os.path.join(args.model_dir, "policy.pt")
-    torch.jit.script(policy).save(policy_path)
+    policy_path = export_policy_jit(runner, args.model_dir)
     print(f"Policy exported to {policy_path}")
 
     if args.use_wandb:

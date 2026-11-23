@@ -134,7 +134,10 @@ def _create_isaacsim_context():
     here can invalidate IsaacLab's global physics view and break asset
     initialization.
     """
-    import isaacsim.core.utils.stage as stage_utils
+    try:  # Isaac Lab 3 owns the stage helpers; Isaac Sim 6.2 dropped isaacsim.core.utils
+        import isaaclab.sim.utils.stage as stage_utils
+    except ImportError:
+        import isaacsim.core.utils.stage as stage_utils
 
     log.debug("Creating new IsaacSim stage")
     stage_utils.create_new_stage()

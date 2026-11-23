@@ -15,6 +15,7 @@ from metasim.scenario.objects import (
     RigidObjCfg,
 )
 from metasim.sim.base import BaseQueryType, BaseSimHandler
+from metasim.utils.isaaclab_compat import as_torch, pose_from_sim
 from metasim.utils.math import convert_quat, quat_apply
 
 try:
@@ -511,7 +512,7 @@ class LidarPointCloud(BaseQueryType):
                     break
             if link_idx is None:
                 link_idx = 0
-            body_state = art.data.body_state_w  # (E, B, 13)
+            body_state = pose_from_sim(as_torch(art.data.body_state_w))  # (E, B, 13), quat (w, x, y, z)
             pos_w = body_state[:, link_idx, 0:3]
             quat_wxyz = body_state[:, link_idx, 3:7]
 
@@ -560,7 +561,7 @@ class LidarPointCloud(BaseQueryType):
                     break
             if link_idx is None:
                 link_idx = 0
-            body_state = art.data.body_state_w
+            body_state = pose_from_sim(as_torch(art.data.body_state_w))
             pos_w = body_state[:, link_idx, 0:3]
             quat_wxyz = body_state[:, link_idx, 3:7]
 

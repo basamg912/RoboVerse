@@ -22,6 +22,7 @@ from loguru import logger
 from metasim.randomization.base import BaseRandomizerType
 from metasim.randomization.core.isaacsim_adapter import IsaacSimAdapter
 from metasim.utils.configclass import configclass
+from metasim.utils.isaaclab_compat import as_torch, quat_from_sim, quat_to_sim
 
 # =============================================================================
 # Configuration Classes
@@ -299,8 +300,8 @@ class CameraRandomizer(BaseRandomizerType):
             # from omni.isaac.lab.utils import math
             from metasim.utils.math import quat_from_euler_xyz, quat_mul
 
-            # Get current orientation
-            current_rot = camera_inst.data.quat_w_world
+            # Get current orientation, as MetaSim (w, x, y, z) for quat_mul
+            current_rot = quat_from_sim(as_torch(camera_inst.data.quat_w_world))
 
             # Generate random rotation deltas (in degrees)
             pitch_delta = self._generate_random_value(
@@ -330,7 +331,7 @@ class CameraRandomizer(BaseRandomizerType):
             new_rot = quat_mul(delta_rotation, current_rot)
 
             # Set new orientation
-            camera_inst.set_world_poses(orientations=new_rot, convention="world")
+            camera_inst.set_world_poses(orientations=quat_to_sim(new_rot), convention="world")
 
         except Exception as e:
             logger.warning(f"Failed to randomize camera orientation: {e}")
@@ -369,7 +370,7 @@ class CameraRandomizer(BaseRandomizerType):
         camera_cfg.look_at = new_look_at
 
         # Get current position
-        current_pos = camera_inst.data.pos_w[:1]
+        current_pos = as_torch(camera_inst.data.pos_w)[:1]
 
         # Apply new look-at
         look_at_tensor = torch.tensor(new_look_at, device=self._actual_handler.device).unsqueeze(0)

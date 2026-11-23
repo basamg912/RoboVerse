@@ -311,7 +311,6 @@ class SceneRandomizer(BaseRandomizerType):
 
         # USD Stage (lazy initialized)
         self.stage = None
-        self.prim_utils = None
 
         # Track created prims for switching
         self._created_prims: dict[str, list[str]] = {}
@@ -321,13 +320,9 @@ class SceneRandomizer(BaseRandomizerType):
 
     def _sub_init(self):
         # Initialize USD
-        try:
-            import omni.isaac.core.utils.prims as prim_utils
-        except ModuleNotFoundError:
-            import isaacsim.core.utils.prims as prim_utils
+        from metasim.utils.isaaclab_compat import get_current_stage
 
-        self.prim_utils = prim_utils
-        self.stage = prim_utils.get_current_stage()
+        self.stage = get_current_stage()
 
     def __call__(self, env_ids: list[int] | None = None):
         """Execute scene randomization.
@@ -668,14 +663,9 @@ class SceneRandomizer(BaseRandomizerType):
             # Load the converted USD (use absolute path)
             usd_path_abs = os.path.abspath(usd_path)
             try:
-                try:
-                    from omni.isaac.core.utils.stage import add_reference_to_stage
-                except ImportError:
-                    import isaacsim.core.utils.stage as stage_utils
+                from metasim.utils.isaaclab_compat import add_usd_reference
 
-                    add_reference_to_stage = stage_utils.add_reference_to_stage
-
-                add_reference_to_stage(usd_path_abs, prim_path)
+                add_usd_reference(usd_path_abs, prim_path)
             except Exception as e:
                 logger.error(f"Failed to load converted USD: {e}")
                 return
@@ -683,14 +673,9 @@ class SceneRandomizer(BaseRandomizerType):
             # USD: Use reference (absolute path)
             usd_path_abs = os.path.abspath(usd_to_load)
             try:
-                try:
-                    from omni.isaac.core.utils.stage import add_reference_to_stage
-                except ImportError:
-                    import isaacsim.core.utils.stage as stage_utils
+                from metasim.utils.isaaclab_compat import add_usd_reference
 
-                    add_reference_to_stage = stage_utils.add_reference_to_stage
-
-                add_reference_to_stage(usd_path_abs, prim_path)
+                add_usd_reference(usd_path_abs, prim_path)
             except Exception as e:
                 # Fallback: use USD API directly
                 ref_prim = self.stage.DefinePrim(prim_path, "Xform")
@@ -763,13 +748,9 @@ class SceneRandomizer(BaseRandomizerType):
         Args:
             prim_path: USD prim path
         """
-        try:
-            import omni.isaac.core.utils.prims as prim_utils
-        except ModuleNotFoundError:
-            import isaacsim.core.utils.prims as prim_utils
-
-        if prim_utils.is_prim_path_valid(prim_path):
-            prim_utils.delete_prim(prim_path)
+        prim = self.stage.GetPrimAtPath(prim_path)
+        if prim and prim.IsValid():
+            self.stage.RemovePrim(prim_path)
 
     def _disable_physics_for_prim(self, prim, keep_collision: bool = False, is_root: bool = True):
         """Recursively disable physics for a prim.

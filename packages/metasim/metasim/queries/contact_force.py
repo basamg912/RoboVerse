@@ -106,7 +106,7 @@ class ContactForces(BaseQueryType):
                     self.handler.gym.acquire_net_contact_force_tensor(self.handler.sim)
                 )
             elif self.simulator == "isaacsim":
-                self._current_contact_force = self.handler.contact_sensor.data.net_forces_w
+                self._current_contact_force = self._isaacsim_net_forces()
             elif self.simulator == "mujoco":
                 self._current_contact_force = self._get_contact_forces_mujoco()
             elif self.simulator in ("newton", "superdex"):
@@ -119,6 +119,11 @@ class ContactForces(BaseQueryType):
                 self._contact_forces_queue.append(
                     self._current_contact_force.clone().view(self.num_envs, -1, 3)[:, self.body_ids_reindex, :]
                 )
+
+    def _isaacsim_net_forces(self) -> torch.Tensor:
+        """IsaacSim contact sensor net forces; Isaac Lab 3 wraps them in a ``ProxyArray`` (``.torch``)."""
+        forces = self.handler.contact_sensor.data.net_forces_w
+        return getattr(forces, "torch", forces)
 
     def _get_contact_forces_mujoco(self) -> torch.Tensor:
         """Compute net contact forces on each body.
@@ -143,7 +148,7 @@ class ContactForces(BaseQueryType):
         if self.simulator == "isaacgym":
             self.handler.gym.refresh_net_contact_force_tensor(self.handler.sim)
         elif self.simulator == "isaacsim":
-            self._current_contact_force = self.handler.contact_sensor.data.net_forces_w
+            self._current_contact_force = self._isaacsim_net_forces()
         elif self.simulator == "mujoco":
             self._current_contact_force = self._get_contact_forces_mujoco()
         elif self.simulator in ("newton", "superdex"):

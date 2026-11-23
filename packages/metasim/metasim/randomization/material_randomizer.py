@@ -29,6 +29,7 @@ from metasim.randomization.base import BaseRandomizerType
 from metasim.randomization.core.isaacsim_adapter import IsaacSimAdapter
 from metasim.randomization.core.object_registry import ObjectRegistry
 from metasim.utils.configclass import configclass
+from metasim.utils.isaaclab_compat import physx_view, torch_to_view, view_indices, view_to_torch
 
 # =============================================================================
 # Utility Functions
@@ -425,20 +426,22 @@ class MaterialRandomizer(BaseRandomizerType):
 
             try:
                 # Get current material properties
-                materials = obj_inst.root_physx_view.get_material_properties()
+                view = physx_view(obj_inst)
+                materials = view_to_torch(view.get_material_properties())
+                mat_env_ids = env_ids_tensor.to(materials.device)
 
                 # Update friction (index 0=static, 1=dynamic, 2=restitution)
                 if len(materials.shape) == 3:
                     # [num_envs, num_bodies, 3]
-                    materials[env_ids_tensor, :, 0] = new_friction.unsqueeze(1).to(materials.device)
-                    materials[env_ids_tensor, :, 1] = new_friction.unsqueeze(1).to(materials.device)
+                    materials[mat_env_ids, :, 0] = new_friction.unsqueeze(1).to(materials.device)
+                    materials[mat_env_ids, :, 1] = new_friction.unsqueeze(1).to(materials.device)
                 else:
                     # [num_envs, 3]
-                    materials[env_ids_tensor, 0] = new_friction.to(materials.device)
-                    materials[env_ids_tensor, 1] = new_friction.to(materials.device)
+                    materials[mat_env_ids, 0] = new_friction.to(materials.device)
+                    materials[mat_env_ids, 1] = new_friction.to(materials.device)
 
                 # Set back
-                obj_inst.root_physx_view.set_material_properties(materials, env_ids_tensor)
+                view.set_material_properties(torch_to_view(materials), view_indices(env_ids_tensor))
             except Exception as e:
                 logger.error(f"Failed to set friction: {e}")
 
@@ -450,18 +453,20 @@ class MaterialRandomizer(BaseRandomizerType):
 
             try:
                 # Get current material properties
-                materials = obj_inst.root_physx_view.get_material_properties()
+                view = physx_view(obj_inst)
+                materials = view_to_torch(view.get_material_properties())
+                mat_env_ids = env_ids_tensor.to(materials.device)
 
                 # Update restitution (index 2)
                 if len(materials.shape) == 3:
                     # [num_envs, num_bodies, 3]
-                    materials[env_ids_tensor, :, 2] = new_restitution.unsqueeze(1).to(materials.device)
+                    materials[mat_env_ids, :, 2] = new_restitution.unsqueeze(1).to(materials.device)
                 else:
                     # [num_envs, 3]
-                    materials[env_ids_tensor, 2] = new_restitution.to(materials.device)
+                    materials[mat_env_ids, 2] = new_restitution.to(materials.device)
 
                 # Set back
-                obj_inst.root_physx_view.set_material_properties(materials, env_ids_tensor)
+                view.set_material_properties(torch_to_view(materials), view_indices(env_ids_tensor))
             except Exception as e:
                 logger.error(f"Failed to set restitution: {e}")
 
