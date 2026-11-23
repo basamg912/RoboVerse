@@ -23,6 +23,16 @@ from metasim.randomization.base import BaseRandomizerType
 from metasim.randomization.core.isaacsim_adapter import IsaacSimAdapter
 from metasim.randomization.core.object_registry import ObjectRegistry
 from metasim.utils.configclass import configclass
+from metasim.utils.isaaclab_compat import (
+    as_torch,
+    is_isaaclab3,
+    physx_view,
+    pose_from_sim,
+    pose_to_sim,
+    torch_to_view,
+    view_indices,
+    view_to_torch,
+)
 
 # =============================================================================
 # Configuration Classes
@@ -229,8 +239,12 @@ class ObjectRandomizer(BaseRandomizerType):
 
         # Randomize mass
         if self.cfg.physics.mass_range:
-            # Get all masses, then index by env_ids (match device)
-            all_masses = obj_inst.root_physx_view.get_masses()
+            # Get all masses, then index by env_ids (match device). Isaac Lab 3 reads them from the asset
+            # data, so the write below goes through the asset and keeps its mass buffer coherent.
+            if is_isaaclab3():
+                all_masses = as_torch(obj_inst.data.body_mass).clone()
+            else:
+                all_masses = obj_inst.root_physx_view.get_masses()
             env_ids_mass = env_ids.to(all_masses.device)
             new_mass = current_mass = all_masses
             num_links = current_mass.shape[1] if len(current_mass.shape) > 1 else 1
@@ -251,7 +265,10 @@ class ObjectRandomizer(BaseRandomizerType):
                 raise ValueError(f"Unsupported operation: {self.cfg.physics.operation}")
 
             # Set masses with indices parameter (use device-matched tensor)
-            obj_inst.root_physx_view.set_masses(new_mass, indices=env_ids_mass)
+            if is_isaaclab3():
+                obj_inst.set_masses_index(masses=new_mass[env_ids_mass], env_ids=env_ids_mass)
+            else:
+                obj_inst.root_physx_view.set_masses(new_mass, indices=env_ids_mass)
 
         # Randomize friction
         if self.cfg.physics.friction_range:
@@ -261,20 +278,22 @@ class ObjectRandomizer(BaseRandomizerType):
 
             try:
                 # Get current material properties
-                materials = obj_inst.root_physx_view.get_material_properties()
+                view = physx_view(obj_inst)
+                materials = view_to_torch(view.get_material_properties())
+                mat_env_ids = env_ids.to(materials.device)
 
                 # Update friction (index 0=static, 1=dynamic, 2=restitution)
                 if len(materials.shape) == 3:
                     # [num_envs, num_bodies, 3]
-                    materials[env_ids, :, 0] = rand_friction.unsqueeze(1).to(materials.device)
-                    materials[env_ids, :, 1] = rand_friction.unsqueeze(1).to(materials.device)
+                    materials[mat_env_ids, :, 0] = rand_friction.unsqueeze(1).to(materials.device)
+                    materials[mat_env_ids, :, 1] = rand_friction.unsqueeze(1).to(materials.device)
                 else:
                     # [num_envs, 3]
-                    materials[env_ids, 0] = rand_friction.to(materials.device)
-                    materials[env_ids, 1] = rand_friction.to(materials.device)
+                    materials[mat_env_ids, 0] = rand_friction.to(materials.device)
+                    materials[mat_env_ids, 1] = rand_friction.to(materials.device)
 
                 # Set back
-                obj_inst.root_physx_view.set_material_properties(materials, env_ids)
+                view.set_material_properties(torch_to_view(materials), view_indices(env_ids))
             except Exception as e:
                 logger.error(f"Failed to set friction: {e}")
 
@@ -286,18 +305,20 @@ class ObjectRandomizer(BaseRandomizerType):
 
             try:
                 # Get current material properties
-                materials = obj_inst.root_physx_view.get_material_properties()
+                view = physx_view(obj_inst)
+                materials = view_to_torch(view.get_material_properties())
+                mat_env_ids = env_ids.to(materials.device)
 
                 # Update restitution (index 2)
                 if len(materials.shape) == 3:
                     # [num_envs, num_bodies, 3]
-                    materials[env_ids, :, 2] = rand_restitution.unsqueeze(1).to(materials.device)
+                    materials[mat_env_ids, :, 2] = rand_restitution.unsqueeze(1).to(materials.device)
                 else:
                     # [num_envs, 3]
-                    materials[env_ids, 2] = rand_restitution.to(materials.device)
+                    materials[mat_env_ids, 2] = rand_restitution.to(materials.device)
 
                 # Set back
-                obj_inst.root_physx_view.set_material_properties(materials, env_ids)
+                view.set_material_properties(torch_to_view(materials), view_indices(env_ids))
             except Exception as e:
                 logger.warning(f"Failed to set restitution: {e}")
 
@@ -327,7 +348,8 @@ class ObjectRandomizer(BaseRandomizerType):
         num_envs = env_ids.shape[0]
 
         # Get current pose
-        root_state = obj_inst.data.root_state_w[env_ids]
+        # MetaSim (w, x, y, z) for the math below; converted back to the Isaac Lab order on write.
+        root_state = pose_from_sim(as_torch(obj_inst.data.root_state_w)[env_ids])
         current_pos = root_state[:, 0:3]
         current_rot = root_state[:, 3:7]
 
@@ -389,7 +411,7 @@ class ObjectRandomizer(BaseRandomizerType):
         new_root_state[:, 0:3] = new_pos
         new_root_state[:, 3:7] = new_rot
 
-        obj_inst.write_root_state_to_sim(new_root_state, env_ids)
+        obj_inst.write_root_state_to_sim(pose_to_sim(new_root_state), env_ids)
         self._mark_visual_dirty()
 
     def _randomize_pose_dynamic(self, obj_meta, env_ids: list[int]):

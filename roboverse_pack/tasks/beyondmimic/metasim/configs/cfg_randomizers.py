@@ -14,6 +14,18 @@ import torch
 from loguru import logger as log
 
 from metasim.sim.base import BaseQueryType, BaseSimHandler
+from metasim.utils.isaaclab_compat import (
+    body_ids_to_physx,
+    get_body_inertias,
+    get_body_masses,
+    get_default_inertias,
+    get_shape_materials,
+    physx_view,
+    set_body_inertias,
+    set_body_masses,
+    set_shape_materials,
+)
+from metasim.utils.isaaclab_compat import num_shapes_per_body as isaac_num_shapes_per_body
 from metasim.utils.math import sample_gaussian, sample_log_uniform, sample_uniform
 
 try:
@@ -103,18 +115,16 @@ class MaterialRandomizer(BaseQueryType):
     def _get_set_shape_indices(self):
         """Get the set shape indices."""
         num_shapes_per_body = None
+        set_body_ids = self.set_body_ids
         if self.simulator_name == "isaacsim":
             if self.obj_name in self.handler.scene.articulations:
                 obj_inst = self.handler.scene.articulations[self.obj_name]
                 # obtain number of shapes per body (needed for indexing the material properties correctly)
                 # note: this is a workaround since the Articulation does not provide a direct way to obtain the number of shapes
                 #  per body. We use the physics simulation view to obtain the number of shapes per body.
-                num_shapes_per_body = []
-                for link_path in obj_inst.root_physx_view.link_paths[0]:
-                    link_physx_view = obj_inst._physics_sim_view.create_rigid_body_view(link_path)  # type: ignore
-                    num_shapes_per_body.append(link_physx_view.max_shapes)
-                # ensure the parsing is correct
-                expected_shapes = obj_inst.root_physx_view.max_shapes
+                num_shapes_per_body, expected_shapes = isaac_num_shapes_per_body(obj_inst)
+                # shape counts are in PhysX link order; map the selected (public) body ids onto it
+                set_body_ids = body_ids_to_physx(obj_inst, self.set_body_ids.tolist())
         elif self.simulator_name == "isaacgym":
             if self.obj_name in self.all_robot_names:
                 _tmp_handle = self.handler._robot_handles[0]
@@ -142,7 +152,7 @@ class MaterialRandomizer(BaseQueryType):
         if num_shapes_per_body is not None:
             set_shape_indices = []
             # sample material properties from the given ranges
-            for body_id in self.set_body_ids:
+            for body_id in set_body_ids:
                 # obtain indices of shapes for the body
                 start_idx = sum(num_shapes_per_body[:body_id])
                 end_idx = start_idx + num_shapes_per_body[body_id]
@@ -178,11 +188,11 @@ class MaterialRandomizer(BaseQueryType):
             )
 
         # retrieve material buffer from the physics simulation
-        materials = (
-            obj_inst.root_physx_view.get_material_properties()
+        materials = get_shape_materials(
+            obj_inst
         )  # (n_envs, n_shapes, 3) where 3 corresponds to static friction, dynamic friction, and restitution
         # randomly assign material IDs to the geometries
-        total_num_shapes = obj_inst.root_physx_view.max_shapes
+        total_num_shapes = physx_view(obj_inst).max_shapes
         bucket_ids = torch.randint(0, self.num_buckets, (len(env_ids), total_num_shapes), device="cpu")
         material_samples = self.material_buckets[bucket_ids]
 
@@ -190,7 +200,7 @@ class MaterialRandomizer(BaseQueryType):
         materials[env_ids] = material_samples[:, self.set_shape_indices]
 
         # apply to simulation
-        obj_inst.root_physx_view.set_material_properties(materials, env_ids)
+        set_shape_materials(obj_inst, materials, env_ids)
 
     def _randomize_isaacgym(self, env_ids: torch.Tensor):
         """Randomize friction properties for IsaacGym simulator."""
@@ -340,8 +350,7 @@ class MassRandomizer(BaseQueryType):
             obj_inst = self.handler.scene.rigid_objects[self.obj_name]
         else:
             raise ValueError(f"Not found: {self.obj_name}.")
-        masses = obj_inst.root_physx_view.get_masses()
-        return masses
+        return get_body_masses(obj_inst)
 
     def _get_masses_isaacgym(self):
         """Get masses for IsaacGym simulator. Note that the isaacgym handler only support 1 robot and multiple objects, currently."""
@@ -395,7 +404,7 @@ class MassRandomizer(BaseQueryType):
             obj_inst = self.handler.scene.articulations[self.obj_name]
         elif self.obj_name in self.handler.scene.rigid_objects:
             obj_inst = self.handler.scene.rigid_objects[self.obj_name]
-        obj_inst.root_physx_view.set_masses(masses, env_ids)
+        set_body_masses(obj_inst, masses, env_ids)
 
     def _set_masses_isaacgym(self, masses: torch.Tensor, env_ids: torch.Tensor):
         """Set masses for IsaacGym simulator."""
@@ -430,17 +439,18 @@ class MassRandomizer(BaseQueryType):
         if self.simulator_name == "isaacsim":
             if self.obj_name in self.handler.scene.articulations:
                 obj_inst = self.handler.scene.articulations[self.obj_name]
-                inertias = obj_inst.root_physx_view.get_inertias()
+                inertias = get_body_inertias(obj_inst)
                 # inertia has shape: (num_envs, num_bodies, 9) for articulation
                 inertias[env_ids[:, None], self.set_body_ids] = (
-                    obj_inst.data.default_inertia[env_ids[:, None], self.set_body_ids] * ratios[..., None]
+                    get_default_inertias(obj_inst)[env_ids[:, None], self.set_body_ids] * ratios[..., None]
                 )
             elif self.obj_name in self.handler.scene.rigid_objects:
                 obj_inst = self.handler.scene.rigid_objects[self.obj_name]
+                inertias = get_body_inertias(obj_inst)
                 # inertia has shape: (num_envs, 9) for rigid object
-                inertias[env_ids] = obj_inst.data.default_inertia[env_ids] * ratios
+                inertias[env_ids] = get_default_inertias(obj_inst)[env_ids] * ratios
             # set the inertia tensors into the physics simulation
-            obj_inst.root_physx_view.set_inertias(inertias, env_ids)
+            set_body_inertias(obj_inst, inertias, env_ids)
         elif self.simulator_name == "isaacgym":
             # For IsaacGym, inertia recomputation is handled automatically by the physics engine
             # when mass is changed, so we don't need to manually update inertias

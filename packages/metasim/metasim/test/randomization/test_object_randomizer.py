@@ -14,6 +14,7 @@ from metasim.randomization.object_randomizer import (
     PhysicsRandomCfg,
     PoseRandomCfg,
 )
+from metasim.utils.isaaclab_compat import as_torch, physx_view, pose_from_sim, view_to_torch
 from metasim.utils.math import euler_xyz_from_quat
 
 
@@ -40,8 +41,8 @@ def object_physics(handler, distribution="uniform", common_range=(0.1, 1.0)):
     obj_inst = _get_object(randomizer)
 
     # Get current mass before randomization
-    current_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
-    current_materials = obj_inst.root_physx_view.get_material_properties().clone().cpu()
+    current_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
+    current_materials = view_to_torch(physx_view(obj_inst).get_material_properties()).clone().cpu()
     current_friction = current_materials[..., 0]  # static friction
     current_restitution = current_materials[..., 2]
 
@@ -49,8 +50,8 @@ def object_physics(handler, distribution="uniform", common_range=(0.1, 1.0)):
     randomizer()
 
     # Get new mass after randomization
-    new_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
-    new_materials = obj_inst.root_physx_view.get_material_properties().clone().cpu()
+    new_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
+    new_materials = view_to_torch(physx_view(obj_inst).get_material_properties()).clone().cpu()
     new_friction = new_materials[..., 0]
     new_restitution = new_materials[..., 2]
     assert (
@@ -99,7 +100,7 @@ def object_pose(handler, distribution="uniform", common_range=(0.1, 1.0)):
     obj_inst = _get_object(randomizer)
 
     # Get current pose before randomization
-    root_state_before = obj_inst.data.root_state_w
+    root_state_before = pose_from_sim(as_torch(obj_inst.data.root_state_w))
     pos_before = root_state_before[:, 0:3].cpu()
     rot_before = root_state_before[:, 3:7].cpu()
     r_before, p_before, y_before = euler_xyz_from_quat(rot_before)
@@ -108,7 +109,7 @@ def object_pose(handler, distribution="uniform", common_range=(0.1, 1.0)):
     randomizer()
 
     # Get new pose after randomization
-    root_state_after = obj_inst.data.root_state_w
+    root_state_after = pose_from_sim(as_torch(obj_inst.data.root_state_w))
     pos_after = root_state_after[:, 0:3].cpu()
     rot_after = root_state_after[:, 3:7].cpu()
 
@@ -155,9 +156,9 @@ def object_operation_types(handler, distribution="uniform", common_range=(0.1, 1
     randomizer_scale = ObjectRandomizer(cfg_scale, seed=789)
     randomizer_scale.bind_handler(handler)
     obj_inst = _get_object(randomizer_scale)
-    before_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    before_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
     randomizer_scale()
-    after_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    after_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
     assert ((after_mass / before_mass - common_range[0]).abs() <= 1e-3).all(), "Scale operation failed"
 
     # Test add operation
@@ -173,9 +174,9 @@ def object_operation_types(handler, distribution="uniform", common_range=(0.1, 1
     randomizer_add = ObjectRandomizer(cfg_add, seed=789)
     randomizer_add.bind_handler(handler)
     obj_inst = _get_object(randomizer_add)
-    before_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    before_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
     randomizer_add()
-    after_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    after_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
     assert ((after_mass - before_mass - common_range[0]).abs() <= 1e-3).all(), "Add operation failed"
 
     # Test abs operation
@@ -191,9 +192,9 @@ def object_operation_types(handler, distribution="uniform", common_range=(0.1, 1
     randomizer_abs = ObjectRandomizer(cfg_abs, seed=789)
     randomizer_abs.bind_handler(handler)
     obj_inst = _get_object(randomizer_abs)
-    before_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    before_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
     randomizer_abs()
-    after_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    after_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
     assert ((after_mass - common_range[0]).abs() <= 1e-3).all(), "Abs operation failed"
 
     log.info(f"Object operation types (Type: {distribution}) test passed")
@@ -220,10 +221,10 @@ def object_seed(handler, distribution="uniform", common_range=(0.1, 1.0)):
     obj_inst = _get_object(randomizer)
     # Store RNG internal state by generating some values
     randomizer.set_seed(42)
-    val1 = obj_inst.root_physx_view.get_masses().clone().cpu()
+    val1 = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
 
     randomizer.set_seed(42)
-    val2 = obj_inst.root_physx_view.get_masses().clone().cpu()
+    val2 = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
 
     assert (val1 == val2).all(), "Same seed should produce same random values"
     log.info("Object seed reproducibility test passed")
@@ -260,11 +261,11 @@ def object_envid(handler, distribution="uniform", common_range=(0.1, 1.0)):
     obj_inst = _get_object(randomizer)
 
     # Mass before randomization (all envs)
-    before_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    before_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
     # Apply randomization limited to target_env_ids
     randomizer()
     # Mass after randomization (all envs)
-    after_mass = obj_inst.root_physx_view.get_masses().clone().cpu()
+    after_mass = view_to_torch(physx_view(obj_inst).get_masses()).clone().cpu()
 
     assert ((after_mass - before_mass)[random_env_ids].abs() > 1e-3).all(), (
         "Mass should have changed for target env_ids"

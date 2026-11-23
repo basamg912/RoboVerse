@@ -9,6 +9,7 @@ from loguru import logger as log
 
 rootutils.setup_root(__file__, pythonpath=True)
 from metasim.randomization.camera_randomizer import CameraRandomCfg, CameraRandomizer
+from metasim.utils.isaaclab_compat import as_torch, quat_from_sim
 
 
 def camera_seed(handler, distribution="uniform", common_range=(1e-8, 10.0)):
@@ -246,8 +247,7 @@ def _get_transform(handler):
     """Extract position and rotation from xformable."""
     camera_inst = handler.scene.sensors["test_camera"]
     position, rotation = camera_inst._view.get_world_poses()
-
-    return position.detach().cpu(), rotation.detach().cpu()
+    return as_torch(position).detach().cpu(), quat_from_sim(as_torch(rotation)).detach().cpu()
 
 
 if __name__ == "__main__":

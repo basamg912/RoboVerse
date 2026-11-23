@@ -43,19 +43,12 @@ class IsaacSimAdapter:
         # Lazy import IsaacSim modules
         try:
             import omni
-
-            try:
-                import omni.isaac.core.utils.prims as prim_utils
-            except ModuleNotFoundError:
-                import isaacsim.core.utils.prims as prim_utils
-
             from omni.kit.material.library import get_material_prim_path
             from pxr import Gf, Sdf, UsdGeom, UsdPhysics, UsdShade
         except ImportError as e:
             raise ImportError(f"IsaacSim modules not available: {e}") from e
 
         self.omni = omni
-        self.prim_utils = prim_utils
         self.get_material_prim_path = get_material_prim_path
         self.Gf = Gf
         self.Sdf = Sdf
@@ -219,7 +212,6 @@ class IsaacSimAdapter:
         """
         import os
 
-        import isaacsim.core.utils.prims as prim_utils
         import omni.kit.commands
         from omni.kit.material.library import get_material_prim_path
         from pxr import UsdGeom, UsdShade
@@ -250,7 +242,7 @@ class IsaacSimAdapter:
             logger.debug(f"Failed to download textures: {e}")
 
         # Get prim
-        prim = prim_utils.get_prim_at_path(prim_path)
+        prim = self.stage.GetPrimAtPath(prim_path)
         if not prim or not prim.IsValid():
             raise ValueError(f"Invalid prim path: {prim_path}")
 
@@ -263,7 +255,7 @@ class IsaacSimAdapter:
         # - material_name: Variant within MDL (optional, e.g., "Plywood::Oak")
         # - mtl_prim_name: Unique prim name to avoid conflicts
         mdl_basename = os.path.basename(mdl_path).removesuffix(".mdl")
-        prim_basename = prim_path.split("/")[-1]
+        prim_basename = prim_path.rsplit("/", maxsplit=1)[-1]
         mtl_prim_unique = f"{mdl_basename}_{prim_basename}_{id(prim_path)}"  # Fully unique
 
         _, mtl_prim_path = get_material_prim_path(mtl_prim_unique)
@@ -628,7 +620,8 @@ class IsaacSimAdapter:
         Returns:
             True if valid, False otherwise
         """
-        return self.prim_utils.is_prim_path_valid(prim_path)
+        prim = self.stage.GetPrimAtPath(prim_path)
+        return bool(prim and prim.IsValid())
 
     def create_xform(self, prim_path: str) -> bool:
         """Create an Xform prim at the given path.
@@ -653,4 +646,4 @@ class IsaacSimAdapter:
             prim_path: USD prim path
         """
         if self.is_valid_prim(prim_path):
-            self.prim_utils.delete_prim(prim_path)
+            self.stage.RemovePrim(prim_path)

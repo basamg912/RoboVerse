@@ -90,3 +90,19 @@ class RslRlEnvWrapper:
         obs_buf and priv_obs_buf properties, so we simply wrap them.
         """
         return TensorDict(policy=self.env.obs_buf, critic=self.env.priv_obs_buf)
+
+
+def export_policy_jit(runner, model_dir: str, filename: str = "policy.pt") -> str:
+    """Export the trained policy as TorchScript and return its path.
+
+    rsl_rl >= 4 provides ``runner.export_policy_to_jit``, which first converts the actor to a scriptable
+    module: its ``GaussianDistribution`` wraps ``torch.distributions.Normal``, which TorchScript cannot
+    script directly. Older rsl_rl returns a scriptable ``act_inference`` from ``get_inference_policy``.
+    """
+    import os
+
+    if hasattr(runner, "export_policy_to_jit"):
+        runner.export_policy_to_jit(model_dir, filename)
+    else:
+        torch.jit.script(runner.get_inference_policy()).save(os.path.join(model_dir, filename))
+    return os.path.join(model_dir, filename)

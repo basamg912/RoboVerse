@@ -18,7 +18,7 @@ rootutils.setup_root(__file__, pythonpath=True)
 
 from metasim.task.registry import _discover_task_modules, get_task_class
 from roboverse_learn.rl.configs.rsl_rl.ppo import RslRlPPOConfig
-from roboverse_learn.rl.rsl_rl.env_wrapper import RslRlEnvWrapper
+from roboverse_learn.rl.rsl_rl.env_wrapper import RslRlEnvWrapper, export_policy_jit
 
 
 def make_roboverse_env(args: RslRlPPOConfig):
@@ -85,25 +85,9 @@ def train(args: RslRlPPOConfig):
     print(f"Model directory: {args.model_dir}")
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 
-    # Export policy. Newer rsl_rl uses ``torch.distributions.Normal`` inside
-    # ``GaussianDistribution``, which TorchScript cannot script. Fall back to a
-    # plain ``state_dict`` ckpt so the run completes either way.
     print("Exporting policy...")
-    policy = runner.get_inference_policy()
-    policy_path = os.path.join(args.model_dir, "policy.pt")
-    try:
-        torch.jit.script(policy).save(policy_path)
-        print(f"Policy (TorchScript) exported to {policy_path}")
-    except RuntimeError as e:
-        if "_distribution" in str(e) or "Normal" in str(e):
-            state_path = os.path.join(args.model_dir, "policy_state_dict.pt")
-            torch.save(policy.state_dict(), state_path)
-            print(
-                f"TorchScript export skipped (Gaussian distribution not scriptable); "
-                f"saved state_dict to {state_path} instead"
-            )
-        else:
-            raise
+    policy_path = export_policy_jit(runner, args.model_dir)
+    print(f"Policy (TorchScript) exported to {policy_path}")
 
     if args.use_wandb:
         wandb.finish()

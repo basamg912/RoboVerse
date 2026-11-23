@@ -1,4 +1,7 @@
-# This naively suites for isaaclab 2.2.0 and isaacsim 5.0.0
+# Supports Isaac Lab 2.x (Isaac Sim 4.5 / 5.0) and Isaac Lab 3.x (Isaac Sim 6.x). The Isaac Lab 3
+# differences (XYZW quaternions, ProxyArray data, the clone plan, the PhysX cfg moving to
+# ``isaaclab_physx``) are absorbed by the ``is_isaaclab3`` (see ``metasim.utils.isaaclab_compat``) helpers below, so the handler keeps
+# MetaSim's WXYZ / torch.Tensor contract on both.
 
 from __future__ import annotations
 
@@ -34,6 +37,15 @@ from metasim.sim import BaseSimHandler
 from metasim.types import ActionBatch, CompatActionInput, DictEnvState
 from metasim.utils.dict import deep_get
 from metasim.utils.gs_util import alpha_blend_rgba_torch
+from metasim.utils.isaaclab_compat import (
+    add_usd_reference,
+    as_torch,
+    get_current_stage,
+    is_isaaclab3,
+    pose_to_sim,
+    quat_from_sim,
+    quat_to_sim,
+)
 from metasim.utils.isaacsim_asset_util import resolve_isaacsim_file_path
 from metasim.utils.state import CameraState, ObjectState, RobotState, TensorState, action_input_to_tensor
 from metasim.utils.terrain_utils import TerrainGenerator
@@ -49,8 +61,8 @@ except ImportError:
 
 
 def _world_state_to_env_local(state_w: torch.Tensor, env_origins: torch.Tensor) -> torch.Tensor:
-    """Return an env-local copy of an IsaacLab world-frame state tensor."""
-    local_state = state_w.clone()
+    """Return an env-local, (w, x, y, z) copy of an IsaacLab world-frame ``(..., 13)`` state tensor."""
+    local_state = as_torch(state_w).clone()
     env_origins = env_origins.to(device=local_state.device, dtype=local_state.dtype)
     if local_state.ndim == 2:
         local_state[:, 0:3] -= env_origins
@@ -58,6 +70,7 @@ def _world_state_to_env_local(state_w: torch.Tensor, env_origins: torch.Tensor) 
         local_state[:, :, 0:3] -= env_origins[:, None, :]
     else:
         raise ValueError(f"Expected state tensor rank 2 or 3, got shape {tuple(local_state.shape)}")
+    local_state[..., 3:7] = quat_from_sim(local_state[..., 3:7])
     return local_state
 
 
@@ -144,6 +157,9 @@ class IsaacsimHandler(BaseSimHandler):
         self.scene = None
         self.sim = None
         self.contact_sensor = None
+        # Isaac Lab 3: assets are constructed only after the clone plan is declared (see
+        # _replicate_environments); until then _register_asset queues (scene dict, name, class, cfg).
+        self._pending_assets: list[tuple[str, str, type, object]] | None = None
 
         if self.headless:
             self._render_viewport = False
@@ -189,22 +205,34 @@ class IsaacsimHandler(BaseSimHandler):
 
         # physics context
         from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
-        from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
+        from isaaclab.sim import SimulationCfg, SimulationContext
+
+        sim_params = self.scenario.sim_params
+        physx_kwargs = dict(
+            bounce_threshold_velocity=sim_params.bounce_threshold_velocity,
+            solver_type=sim_params.solver_type,
+            max_position_iteration_count=sim_params.num_position_iterations,
+            max_velocity_iteration_count=sim_params.num_velocity_iterations,
+            friction_correlation_distance=sim_params.friction_correlation_distance,
+            friction_offset_threshold=sim_params.friction_offset_threshold,
+        )
+        if is_isaaclab3():
+            # 3.x: the PhysX cfg is backend-owned and is passed as the generic ``physics`` field.
+            from isaaclab_physx.physics import PhysxCfg
+
+            physics_kwargs = {"physics": PhysxCfg(**physx_kwargs)}
+        else:
+            from isaaclab.sim import PhysxCfg
+
+            physics_kwargs = {"physx": PhysxCfg(**physx_kwargs)}
 
         sim_device = self._resolve_sim_device()
         self._sync_tensor_device_with_sim_device()
         sim_config: SimulationCfg = SimulationCfg(
             device=sim_device,
             render_interval=self.scenario.decimation,  # TODO divide into render interval and control decimation
-            physx=PhysxCfg(
-                bounce_threshold_velocity=self.scenario.sim_params.bounce_threshold_velocity,
-                solver_type=self.scenario.sim_params.solver_type,
-                max_position_iteration_count=self.scenario.sim_params.num_position_iterations,
-                max_velocity_iteration_count=self.scenario.sim_params.num_velocity_iterations,
-                friction_correlation_distance=self.scenario.sim_params.friction_correlation_distance,
-                friction_offset_threshold=self.scenario.sim_params.friction_offset_threshold,
-            ),
             dt=self.physics_dt,
+            **physics_kwargs,
         )
 
         self.sim: SimulationContext = SimulationContext(sim_config)
@@ -213,7 +241,7 @@ class IsaacsimHandler(BaseSimHandler):
         )
         self.scene = InteractiveScene(scene_config)
 
-        if self.sim.has_gui():
+        if self._has_gui():
             self._init_keyboard()
 
     def _load_robots(self) -> None:
@@ -272,10 +300,11 @@ class IsaacsimHandler(BaseSimHandler):
         for robot in self.robots:
             robot_inst = self.scene.articulations[robot.name]
             joint_names = list(robot_inst.joint_names)
-            joint_pos = robot_inst.data.default_joint_pos[env_ids].clone()
+            joint_pos = as_torch(robot_inst.data.default_joint_pos)[env_ids].clone()
+            defaults = robot.default_joint_positions or {}
             for joint_index, joint_name in enumerate(joint_names):
-                if joint_name in robot.default_joint_positions:
-                    joint_pos[:, joint_index] = float(robot.default_joint_positions[joint_name])
+                if joint_name in defaults:
+                    joint_pos[:, joint_index] = float(defaults[joint_name])
             joint_vel = torch.zeros_like(joint_pos)
             robot_inst.set_joint_position_target(joint_pos, env_ids=env_ids)
             robot_inst.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
@@ -301,17 +330,27 @@ class IsaacsimHandler(BaseSimHandler):
 
     def _launch_impl(self, simulation_app=None, simulation_args=None) -> None:
         self._init_scene(simulation_app, simulation_args)
+        isaaclab3 = is_isaaclab3()
+        if isaaclab3:
+            self._pending_assets = []
         self._load_robots()
         self._load_sensors()
         if self.scenario.scene is None:
             self._load_terrain()
-        self._load_scene()
+        if not isaaclab3:
+            self._load_scene()
         self._load_objects()
         self._load_lights()
         self._load_render_settings()
-        self.scene.clone_environments(copy_from_source=False)
-        self.scene.filter_collisions(global_prim_paths=["/World/ground"])
-        self._load_cameras()
+        if isaaclab3:
+            # Cameras are spawned per env, so they join the clone plan rather than being added after it.
+            self._load_cameras()
+            self._replicate_environments()
+            self._load_scene()
+        else:
+            self.scene.clone_environments(copy_from_source=False)
+            self.scene.filter_collisions(global_prim_paths=["/World/ground"])
+            self._load_cameras()
         self._initialize_physics_before_reset()
         self.sim.reset()
         indices = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
@@ -328,7 +367,7 @@ class IsaacsimHandler(BaseSimHandler):
         self._update_camera_pose()
 
         # Force a render to update camera data after position is set
-        if self.sim.has_gui() or self.sim.has_rtx_sensors():
+        if self._is_rendering():
             self.sim.render()
         for sensor in self.scene.sensors.values():
             sensor.update(dt=0)
@@ -340,6 +379,45 @@ class IsaacsimHandler(BaseSimHandler):
             if hasattr(sensor, "_initialize_callback"):
                 sensor._initialize_callback(None)
 
+    def _has_gui(self) -> bool:
+        """``SimulationContext.has_gui`` is a method in Isaac Lab 2.x and a property in 3.x."""
+        has_gui = self.sim.has_gui
+        return bool(has_gui() if callable(has_gui) else has_gui)
+
+    def _is_rendering(self) -> bool:
+        """GUI or RTX sensors present. Isaac Lab 3 dropped ``SimulationContext.has_rtx_sensors()``."""
+        if self._has_gui():
+            return True
+        has_rtx_sensors = getattr(self.sim, "has_rtx_sensors", None)
+        if callable(has_rtx_sensors):
+            return bool(has_rtx_sensors())
+        return bool(self.sim.get_setting("/isaaclab/render/rtx_sensors"))
+
+    def _register_asset(self, kind: str, name: str, cls: type, cfg) -> None:
+        """Construct ``cls(cfg)`` into ``self.scene.<kind>[name]``, or queue it for the Isaac Lab 3 clone plan."""
+        if self._pending_assets is not None:
+            self._pending_assets.append((kind, name, cls, cfg))
+            return
+        getattr(self.scene, kind)[name] = cls(cfg)
+
+    def _replicate_environments(self) -> None:
+        """Isaac Lab 3 replacement for ``InteractiveScene.clone_environments``.
+
+        3.x replicates declared assets through a clone plan that has to exist before the assets are
+        constructed (it rewrites their prim paths), so the queued cfgs are planned, constructed into
+        env_0, then replicated to every env.
+        """
+        from isaaclab import cloner
+
+        pending, self._pending_assets = self._pending_assets or [], None
+        plan = cloner.clone_plan_from_env_0(
+            self.scene.cloner_cfg, [cfg for *_, cfg in pending], self.num_envs, self.scenario.env_spacing
+        )
+        for kind, name, cls, cfg in pending:
+            getattr(self.scene, kind)[name] = cls(cfg)
+        cloner.replicate(plan)
+        self.scene.filter_collisions(global_prim_paths=["/World/ground"])
+
     def _on_launch_failure(self, err: Exception) -> None:
         """Free the GPU after a launch-time failure so the process cannot hang.
 
@@ -349,6 +427,9 @@ class IsaacsimHandler(BaseSimHandler):
         still exits instead of hanging.
         """
         log.error(f"IsaacSim launch failed ({type(err).__name__}: {err}); closing SimulationApp to free the GPU.")
+        if is_isaaclab3():
+            # Isaac Lab 3's close() ends the process, so the re-raise in launch() never prints.
+            log.opt(exception=err).error("IsaacSim launch failure traceback")
         self._maybe_hint_numpy_abi(err)
         if getattr(self, "_owns_simulation_app", False) and getattr(self, "simulation_app", None) is not None:
             try:
@@ -432,28 +513,16 @@ class IsaacsimHandler(BaseSimHandler):
                         log.debug(f"SimulationContext.clear_instance() failed during close: {err}")
 
             if simulation_app is not None and force_exit_on_close_hang and owns_simulation_app:
-                close_error: dict[str, Exception] = {}
+                import sys
 
-                def _close_sim_app() -> None:
-                    try:
-                        # Isaac Sim may hang on shutdown waiting for Replicator workers.
-                        simulation_app.close(wait_for_replicator=False)
-                    except TypeError:
-                        # Backward compatibility with versions where close() has no kwargs.
-                        simulation_app.close()
-                    except Exception as err:
-                        close_error["error"] = err
+                # Read on the calling thread: exc_info is per-thread.
+                propagating = sys.exc_info()[0]
 
-                close_thread = threading.Thread(target=_close_sim_app, daemon=True)
-                close_thread.start()
-                close_thread.join(timeout=close_timeout_s)
-                if close_thread.is_alive():
+                def _force_exit() -> None:
                     log.warning(
                         f"SimulationApp.close() exceeded {close_timeout_s:.1f}s. "
                         "Forcing process exit to avoid shutdown hang."
                     )
-                    import sys
-
                     sys.stdout.flush()
                     sys.stderr.flush()
                     # The simulation itself finished; only Kit's shutdown hung (it does on
@@ -468,12 +537,39 @@ class IsaacsimHandler(BaseSimHandler):
                     except ValueError:
                         log.error(f"METASIM_ISAACSIM_HANG_EXIT_CODE={raw!r} is not an integer; exiting 1")
                         exit_code = 1
-                    if sys.exc_info()[0] is not None:
-                        log.error(f"exiting 1: {sys.exc_info()[0].__name__} was propagating when close() hung")
+                    if propagating is not None:
+                        log.error(f"exiting 1: {propagating.__name__} was propagating when close() hung")
                         exit_code = 1
                     os._exit(exit_code)
-                if "error" in close_error:
-                    raise close_error["error"]
+
+                if is_isaaclab3():
+                    # Isaac Lab 3's close() installs a SIGINT handler (main thread only) and ends the
+                    # process itself, so it runs on this thread with a watchdog against a hang.
+                    watchdog = threading.Timer(close_timeout_s, _force_exit)
+                    watchdog.daemon = True
+                    watchdog.start()
+                    simulation_app.close(exit_code=0 if propagating is None else 1)
+                    watchdog.cancel()
+                else:
+                    close_error: dict[str, Exception] = {}
+
+                    def _close_sim_app() -> None:
+                        try:
+                            # Isaac Sim may hang on shutdown waiting for Replicator workers.
+                            simulation_app.close(wait_for_replicator=False)
+                        except TypeError:
+                            # Backward compatibility with versions where close() has no kwargs.
+                            simulation_app.close()
+                        except Exception as err:
+                            close_error["error"] = err
+
+                    close_thread = threading.Thread(target=_close_sim_app, daemon=True)
+                    close_thread.start()
+                    close_thread.join(timeout=close_timeout_s)
+                    if close_thread.is_alive():
+                        _force_exit()
+                    if "error" in close_error:
+                        raise close_error["error"]
             elif simulation_app is not None and owns_simulation_app:
                 try:
                     simulation_app.close(wait_for_replicator=False)
@@ -536,7 +632,10 @@ class IsaacsimHandler(BaseSimHandler):
 
             if simulation_app is not None and not owns_simulation_app:
                 try:
-                    import isaacsim.core.utils.stage as stage_utils
+                    try:
+                        import isaaclab.sim.utils.stage as stage_utils
+                    except ImportError:
+                        import isaacsim.core.utils.stage as stage_utils
 
                     stage_utils.close_stage()
                 except Exception as err:
@@ -637,7 +736,7 @@ class IsaacsimHandler(BaseSimHandler):
                 # Set root state (fix_base_link only affects physics, not manual state setting)
                 root_state = states.objects[obj.name].root_state.clone()
                 root_state[:, :3] += self.scene.env_origins
-                obj_inst.write_root_pose_to_sim(root_state[env_ids, :7], env_ids=env_ids)
+                obj_inst.write_root_pose_to_sim(pose_to_sim(root_state[env_ids, :7]), env_ids=env_ids)
                 obj_inst.write_root_velocity_to_sim(root_state[env_ids, 7:], env_ids=env_ids)
                 # Set joint state for articulated objects
                 if isinstance(obj, ArticulationObjCfg):
@@ -660,7 +759,7 @@ class IsaacsimHandler(BaseSimHandler):
                 robot_inst = self.scene.articulations[robot.name]
                 root_state = states.robots[robot.name].root_state.clone()
                 root_state[:, :3] += self.scene.env_origins
-                robot_inst.write_root_pose_to_sim(root_state[env_ids, :7], env_ids=env_ids)
+                robot_inst.write_root_pose_to_sim(pose_to_sim(root_state[env_ids, :7]), env_ids=env_ids)
                 robot_inst.write_root_velocity_to_sim(
                     states.robots[robot.name].root_state[env_ids, 7:], env_ids=env_ids
                 )
@@ -760,7 +859,7 @@ class IsaacsimHandler(BaseSimHandler):
         if self._physics_step_counter == 0 and not self._render_current:
             self._update_camera_pose()
             # Force render and sensor update for first frame
-            if self.sim.has_gui() or self.sim.has_rtx_sensors():
+            if self._is_rendering():
                 self.sim.render()
             for sensor in self.scene.sensors.values():
                 sensor.update(dt=0)
@@ -773,14 +872,14 @@ class IsaacsimHandler(BaseSimHandler):
                 body_reindex = self.get_body_reindex(obj.name)
                 root_state = _world_state_to_env_local(obj_inst.data.root_state_w, self.scene.env_origins)
                 body_state = _world_state_to_env_local(
-                    obj_inst.data.body_state_w[:, body_reindex], self.scene.env_origins
+                    as_torch(obj_inst.data.body_state_w)[:, body_reindex], self.scene.env_origins
                 )
                 state = ObjectState(
                     root_state=root_state,
                     body_names=self._get_body_names(obj.name),
                     body_state=body_state,
-                    joint_pos=obj_inst.data.joint_pos[:, joint_reindex].clone(),
-                    joint_vel=obj_inst.data.joint_vel[:, joint_reindex].clone(),
+                    joint_pos=as_torch(obj_inst.data.joint_pos)[:, joint_reindex].clone(),
+                    joint_vel=as_torch(obj_inst.data.joint_vel)[:, joint_reindex].clone(),
                 )
             else:
                 obj_inst = self.scene.rigid_objects[obj.name]
@@ -796,20 +895,23 @@ class IsaacsimHandler(BaseSimHandler):
             joint_reindex = self.get_joint_reindex(obj.name)
             body_reindex = self.get_body_reindex(obj.name)
             root_state = _world_state_to_env_local(obj_inst.data.root_state_w, self.scene.env_origins)
-            body_state = _world_state_to_env_local(obj_inst.data.body_state_w[:, body_reindex], self.scene.env_origins)
+            body_state = _world_state_to_env_local(
+                as_torch(obj_inst.data.body_state_w)[:, body_reindex], self.scene.env_origins
+            )
+            data = obj_inst.data
             state = RobotState(
                 root_state=root_state,
                 body_names=self._get_body_names(obj.name),
                 body_state=body_state,
-                joint_pos=obj_inst.data.joint_pos[:, joint_reindex].clone(),
-                joint_vel=obj_inst.data.joint_vel[:, joint_reindex].clone(),
+                joint_pos=as_torch(data.joint_pos)[:, joint_reindex].clone(),
+                joint_vel=as_torch(data.joint_vel)[:, joint_reindex].clone(),
                 joint_pos_target=(
-                    obj_inst.data.joint_pos_target[:, joint_reindex].clone()
+                    as_torch(data.joint_pos_target)[:, joint_reindex].clone()
                     if self._robot_reports_position_target(obj.name)
                     else None
                 ),
-                joint_vel_target=obj_inst.data.joint_vel_target[:, joint_reindex].clone(),
-                joint_effort_target=obj_inst.data.joint_effort_target[:, joint_reindex].clone(),
+                joint_vel_target=as_torch(data.joint_vel_target)[:, joint_reindex].clone(),
+                joint_effort_target=as_torch(data.joint_effort_target)[:, joint_reindex].clone(),
             )
             robot_states[obj.name] = state
 
@@ -820,12 +922,12 @@ class IsaacsimHandler(BaseSimHandler):
 
         for camera in self.cameras:
             camera_inst = self.scene.sensors[camera.name]
-            rgb_data = camera_inst.data.output.get("rgb", None)
-            depth_data = camera_inst.data.output.get("depth", None)
+            rgb_data = as_torch(camera_inst.data.output.get("rgb", None))
+            depth_data = as_torch(camera_inst.data.output.get("depth", None))
             camera_info = self._camera_info_mapping(camera_inst)
-            instance_seg_data = deep_get(camera_inst.data.output, "instance_segmentation_fast")
+            instance_seg_data = as_torch(deep_get(camera_inst.data.output, "instance_segmentation_fast"))
             instance_seg_id2label = deep_get(camera_info, "instance_segmentation_fast", "idToLabels")
-            instance_id_seg_data = deep_get(camera_inst.data.output, "instance_id_segmentation_fast")
+            instance_id_seg_data = as_torch(deep_get(camera_inst.data.output, "instance_id_segmentation_fast"))
             instance_id_seg_id2label = deep_get(camera_info, "instance_id_segmentation_fast", "idToLabels")
             if instance_seg_data is not None:
                 instance_seg_data = instance_seg_data.squeeze(-1)
@@ -896,8 +998,8 @@ class IsaacsimHandler(BaseSimHandler):
                 instance_seg_id2label=instance_seg_id2label,
                 instance_id_seg=instance_id_seg_data,
                 instance_id_seg_id2label=instance_id_seg_id2label,
-                pos=camera_inst.data.pos_w.clone(),
-                quat_world=camera_inst.data.quat_w_world.clone(),
+                pos=as_torch(camera_inst.data.pos_w).clone(),
+                quat_world=quat_from_sim(as_torch(camera_inst.data.quat_w_world)).clone(),
                 intrinsics=torch.tensor(camera.intrinsics, device=self.device)[None, ...].repeat(self.num_envs, 1, 1),
             )
         extras = self.get_extra()
@@ -917,6 +1019,10 @@ class IsaacsimHandler(BaseSimHandler):
             if event.type == carb.input.KeyboardEventType.KEY_PRESS:
                 self._render_viewport = not self._render_viewport
 
+            if not hasattr(self.sim, "set_render_mode"):
+                # Isaac Lab 3 removed the render-mode toggle; rendering is owned by its visualizers.
+                log.warning("Viewport render toggle (V) is not available with Isaac Lab 3.")
+                return
             if not self._render_viewport:
                 if self.sim.has_rtx_sensors():
                     self.sim.set_render_mode(SimulationContext.RenderMode.PARTIAL_RENDERING)
@@ -983,7 +1089,7 @@ class IsaacsimHandler(BaseSimHandler):
             robot_inst.write_data_to_sim()
 
     def _simulate(self):
-        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        is_rendering = self._is_rendering()
         self.scene.write_data_to_sim()
 
         # Decimation: run physics multiple times per control step for better stability
@@ -1047,16 +1153,27 @@ class IsaacsimHandler(BaseSimHandler):
                 ),
             ),
         )
+        # Isaac Lab 3.1 renamed the actuator limits (and removed the old names): the solver limits
+        # ``*_limit_sim`` -> ``joint_*_limit``, the rated ``velocity_limit`` -> ``actuator_velocity_limit``.
+        if "joint_effort_limit" in ImplicitActuatorCfg.__dataclass_fields__:
+            limit_fields = ("joint_effort_limit", "joint_velocity_limit", "actuator_velocity_limit")
+        else:
+            limit_fields = ("effort_limit_sim", "velocity_limit_sim", "velocity_limit")
+        effort_field, velocity_sim_field, velocity_field = limit_fields
         cfg = ArticulationCfg(
             spawn=spawn_cfg,
             actuators={
                 jn: ImplicitActuatorCfg(
                     joint_names_expr=[jn],
-                    effort_limit_sim=actuator.effort_limit_sim,
-                    velocity_limit_sim=actuator.velocity_limit_sim,
                     stiffness=actuator.stiffness if not manual_pd else 0.0,
                     damping=actuator.damping if not manual_pd else 0.0,
                     armature=actuator.armature if actuator.armature is not None else getattr(robot, "armature", 0.01),
+                    **{
+                        effort_field: actuator.effort_limit_sim,
+                        velocity_sim_field: actuator.velocity_limit_sim,
+                        # NOTE the rated velocity limit doesn't take effect on an implicit actuator
+                        velocity_field: actuator.velocity_limit,
+                    },
                 )
                 for jn, actuator in robot.actuators.items()
             },
@@ -1064,16 +1181,13 @@ class IsaacsimHandler(BaseSimHandler):
         cfg.prim_path = f"/World/envs/env_.*/{robot.name}"
         init_state = ArticulationCfg.InitialStateCfg(
             pos=robot.default_position,
-            rot=robot.default_orientation,
-            joint_pos=robot.default_joint_positions,
+            rot=quat_to_sim(robot.default_orientation),
+            # Isaac Lab 3 rejects None; {".*": 0.0} is Isaac Lab's own default.
+            joint_pos=robot.default_joint_positions or {".*": 0.0},
             joint_vel={".*": 0.0},
         )
         cfg.init_state = init_state
-        # NOTE `velocity_limit` here won't take effect
-        for joint_name, actuator in robot.actuators.items():
-            cfg.actuators[joint_name].velocity_limit = actuator.velocity_limit
-        robot_inst = Articulation(cfg)
-        self.scene.articulations[robot.name] = robot_inst
+        self._register_asset("articulations", robot.name, Articulation, cfg)
 
     def _add_object(self, obj: BaseObjCfg) -> None:
         """Add an object to the scene."""
@@ -1096,11 +1210,11 @@ class IsaacsimHandler(BaseSimHandler):
                 ),
                 init_state=ArticulationCfg.InitialStateCfg(
                     pos=obj.default_position,
-                    rot=obj.default_orientation,
+                    rot=quat_to_sim(obj.default_orientation),
                 ),
                 actuators={},
             )
-            self.scene.articulations[obj.name] = Articulation(articulation_cfg)
+            self._register_asset("articulations", obj.name, Articulation, articulation_cfg)
             return
 
         if obj.fix_base_link:
@@ -1124,7 +1238,10 @@ class IsaacsimHandler(BaseSimHandler):
 
         ## Primitive object
         if isinstance(obj, PrimitiveCubeCfg):
-            self.scene.rigid_objects[obj.name] = RigidObject(
+            self._register_asset(
+                "rigid_objects",
+                obj.name,
+                RigidObject,
                 RigidObjectCfg(
                     prim_path=prim_path,
                     spawn=sim_utils.MeshCuboidCfg(
@@ -1138,13 +1255,16 @@ class IsaacsimHandler(BaseSimHandler):
                     ),
                     init_state=RigidObjectCfg.InitialStateCfg(
                         pos=obj.default_position,
-                        rot=obj.default_orientation,
+                        rot=quat_to_sim(obj.default_orientation),
                     ),
-                )
+                ),
             )
             return
         if isinstance(obj, PrimitiveSphereCfg):
-            self.scene.rigid_objects[obj.name] = RigidObject(
+            self._register_asset(
+                "rigid_objects",
+                obj.name,
+                RigidObject,
                 RigidObjectCfg(
                     prim_path=prim_path,
                     spawn=sim_utils.MeshSphereCfg(
@@ -1158,13 +1278,16 @@ class IsaacsimHandler(BaseSimHandler):
                     ),
                     init_state=RigidObjectCfg.InitialStateCfg(
                         pos=obj.default_position,
-                        rot=obj.default_orientation,
+                        rot=quat_to_sim(obj.default_orientation),
                     ),
-                )
+                ),
             )
             return
         if isinstance(obj, PrimitiveCylinderCfg):
-            self.scene.rigid_objects[obj.name] = RigidObject(
+            self._register_asset(
+                "rigid_objects",
+                obj.name,
+                RigidObject,
                 RigidObjectCfg(
                     prim_path=prim_path,
                     spawn=sim_utils.MeshCylinderCfg(
@@ -1179,14 +1302,17 @@ class IsaacsimHandler(BaseSimHandler):
                     ),
                     init_state=RigidObjectCfg.InitialStateCfg(
                         pos=obj.default_position,
-                        rot=obj.default_orientation,
+                        rot=quat_to_sim(obj.default_orientation),
                     ),
-                )
+                ),
             )
             return
         if isinstance(obj, PrimitiveFrameCfg):
             usd_path = obj.usd_path or _primitive_frame_usd_path()
-            self.scene.rigid_objects[obj.name] = RigidObject(
+            self._register_asset(
+                "rigid_objects",
+                obj.name,
+                RigidObject,
                 RigidObjectCfg(
                     prim_path=prim_path,
                     spawn=sim_utils.UsdFileCfg(
@@ -1197,7 +1323,7 @@ class IsaacsimHandler(BaseSimHandler):
                         collision_props=None,  # no collision
                         scale=obj.scale,
                     ),
-                )
+                ),
             )
             return
 
@@ -1212,14 +1338,17 @@ class IsaacsimHandler(BaseSimHandler):
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(articulation_enabled=False),
             )
             if isinstance(obj, RigidObjCfg):
-                self.scene.rigid_objects[obj.name] = RigidObject(
+                self._register_asset(
+                    "rigid_objects",
+                    obj.name,
+                    RigidObject,
                     RigidObjectCfg(
                         prim_path=prim_path,
                         spawn=usd_file_cfg,
                         init_state=RigidObjectCfg.InitialStateCfg(
-                            pos=obj.default_position, rot=obj.default_orientation
+                            pos=obj.default_position, rot=quat_to_sim(obj.default_orientation)
                         ),
-                    )
+                    ),
                 )
                 return
 
@@ -1340,12 +1469,7 @@ class IsaacsimHandler(BaseSimHandler):
 
         from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics, UsdShade
 
-        try:
-            import omni.isaac.core.utils.prims as prim_utils
-        except ModuleNotFoundError:
-            import isaacsim.core.utils.prims as prim_utils
-
-        stage = prim_utils.get_current_stage()
+        stage = get_current_stage()
         if stage is None:
             log.error("IsaacSim stage is not available; cannot create terrain mesh.")
             return
@@ -1454,15 +1578,10 @@ class IsaacsimHandler(BaseSimHandler):
             log.warning("Scene USD path is None, skipping scene loading")
             return
 
-        try:
-            import omni.isaac.core.utils.prims as prim_utils
-        except ModuleNotFoundError:
-            import isaacsim.core.utils.prims as prim_utils
-
         from pxr import Gf, UsdGeom
 
         # Get current stage
-        stage = prim_utils.get_current_stage()
+        stage = get_current_stage()
         if not stage:
             log.error("Failed to get current stage")
             return
@@ -1479,53 +1598,47 @@ class IsaacsimHandler(BaseSimHandler):
             log.error(f"Scene USD file not found: {usd_path}")
             return
 
-        # Load scene for source environment (env_0)
-        source_scene_path = f"/World/envs/env_0/{scene_name}"
+        # Isaac Lab 2.x clones env_0 wholesale, so the scene is referenced into env_0 before the
+        # clone. Isaac Lab 3 replicates only the planned assets, so it is referenced into every env
+        # after replication (_launch_impl).
+        if is_isaaclab3():
+            env_scene_paths = [f"{env_path}/{scene_name}" for env_path in self.scene.env_prim_paths]
+        else:
+            env_scene_paths = [f"/World/envs/env_0/{scene_name}"]
+        for source_scene_path in env_scene_paths:
+            add_usd_reference(usd_path, source_scene_path)
 
-        # Add USD reference to stage
-        try:
-            from omni.isaac.core.utils.stage import add_reference_to_stage
+            # Apply transformations if specified
+            scene_prim = stage.GetPrimAtPath(source_scene_path)
+            if scene_prim.IsValid():
+                xformable = UsdGeom.Xformable(scene_prim)
 
-            add_reference_to_stage(usd_path, source_scene_path)
-        except ImportError:
-            # Fallback: use USD API directly
-            ref_prim = stage.DefinePrim(source_scene_path, "Xform")
-            if not ref_prim:
-                log.error(f"Failed to create prim at {source_scene_path}")
-                return
-            ref_prim.GetReferences().AddReference(usd_path)
+                # Clear existing transform operations
+                xformable.ClearXformOpOrder()
 
-        # Apply transformations if specified
-        scene_prim = stage.GetPrimAtPath(source_scene_path)
-        if scene_prim.IsValid():
-            xformable = UsdGeom.Xformable(scene_prim)
+                # Apply scale if specified
+                if scene_cfg.scale is not None:
+                    scale_op = xformable.AddScaleOp()
+                    scale_op.Set(Gf.Vec3d(*scene_cfg.scale))
 
-            # Clear existing transform operations
-            xformable.ClearXformOpOrder()
+                # Apply rotation if specified (using quaternion directly)
+                if scene_cfg.quat is not None:
+                    # SceneCfg quat format is (w, x, y, z)
+                    qw, qx, qy, qz = scene_cfg.quat
+                    # USD quaternion format is (real, imag_i, imag_j, imag_k) = (w, x, y, z)
+                    # Use Quatf (float) instead of Quatd (double) as USD expects float precision
+                    quat_gf = Gf.Quatf(float(qw), float(qx), float(qy), float(qz))
+                    # Use orient op to set quaternion rotation directly
+                    orient_op = xformable.AddOrientOp()
+                    orient_op.Set(quat_gf)
 
-            # Apply scale if specified
-            if scene_cfg.scale is not None:
-                scale_op = xformable.AddScaleOp()
-                scale_op.Set(Gf.Vec3d(*scene_cfg.scale))
+                # Apply fixed position offset if specified
+                if scene_cfg.default_position is not None:
+                    translate_op = xformable.AddTranslateOp()
+                    translate_op.Set(Gf.Vec3d(*scene_cfg.default_position))
+                    log.debug(f"Set scene position offset: {scene_cfg.default_position}")
 
-            # Apply rotation if specified (using quaternion directly)
-            if scene_cfg.quat is not None:
-                # SceneCfg quat format is (w, x, y, z)
-                qw, qx, qy, qz = scene_cfg.quat
-                # USD quaternion format is (real, imag_i, imag_j, imag_k) = (w, x, y, z)
-                # Use Quatf (float) instead of Quatd (double) as USD expects float precision
-                quat_gf = Gf.Quatf(float(qw), float(qx), float(qy), float(qz))
-                # Use orient op to set quaternion rotation directly
-                orient_op = xformable.AddOrientOp()
-                orient_op.Set(quat_gf)
-
-            # Apply fixed position offset if specified
-            if scene_cfg.default_position is not None:
-                translate_op = xformable.AddTranslateOp()
-                translate_op.Set(Gf.Vec3d(*scene_cfg.default_position))
-                log.debug(f"Set scene position offset: {scene_cfg.default_position}")
-
-            log.info(f"Loaded scene from {usd_path} at {source_scene_path}")
+                log.info(f"Loaded scene from {usd_path} at {source_scene_path}")
 
     def _load_render_settings(self) -> None:
         try:
@@ -1646,7 +1759,7 @@ class IsaacsimHandler(BaseSimHandler):
             spawn_light(
                 "/World/DefaultLight",
                 sim_utils.DistantLightCfg(intensity=2000.0, angle=0.53),  # Increased default intensity
-                orientation=(1.0, 0.0, 0.0, 0.0),
+                orientation=quat_to_sim((1.0, 0.0, 0.0, 0.0)),
                 translation=(0, 0, 10),
             )
 
@@ -1675,7 +1788,7 @@ class IsaacsimHandler(BaseSimHandler):
         spawn_light(
             light_name,
             isaac_light_cfg,
-            orientation=orientation,
+            orientation=quat_to_sim(orientation),
             translation=(0, 0, 10),  # Distant lights don't need specific translation
         )
 
@@ -1704,7 +1817,7 @@ class IsaacsimHandler(BaseSimHandler):
         spawn_light(
             light_name,
             isaac_light_cfg,
-            orientation=light_cfg.rot,
+            orientation=quat_to_sim(light_cfg.rot),
             translation=light_cfg.pos,
         )
 
@@ -1738,7 +1851,7 @@ class IsaacsimHandler(BaseSimHandler):
         spawn_light(
             light_name,
             isaac_light_cfg,
-            orientation=(1.0, 0.0, 0.0, 0.0),
+            orientation=quat_to_sim((1.0, 0.0, 0.0, 0.0)),
             translation=(0, 0, 0),  # Dome lights are typically at origin
         )
 
@@ -1767,7 +1880,7 @@ class IsaacsimHandler(BaseSimHandler):
         spawn_light(
             light_name,
             isaac_light_cfg,
-            orientation=(1.0, 0.0, 0.0, 0.0),
+            orientation=quat_to_sim((1.0, 0.0, 0.0, 0.0)),
             translation=light_cfg.pos,
         )
 
@@ -1799,7 +1912,7 @@ class IsaacsimHandler(BaseSimHandler):
         spawn_light(
             light_name,
             isaac_light_cfg,
-            orientation=light_cfg.rot,
+            orientation=quat_to_sim(light_cfg.rot),
             translation=light_cfg.pos,
         )
 
@@ -1838,8 +1951,8 @@ class IsaacsimHandler(BaseSimHandler):
             raise ValueError(f"Object {obj_name} not found")
 
         if obj_subpath is None:
-            pos = obj_inst.data.root_pos_w[env_ids] - self.scene.env_origins[env_ids]
-            rot = obj_inst.data.root_quat_w[env_ids]
+            pos = as_torch(obj_inst.data.root_pos_w)[env_ids] - self.scene.env_origins[env_ids]
+            rot = quat_from_sim(as_torch(obj_inst.data.root_quat_w)[env_ids])
         else:
             log.error(f"Subpath {obj_subpath} is not supported in IsaacsimHandler.get_pose")
 
@@ -1877,7 +1990,7 @@ class IsaacsimHandler(BaseSimHandler):
         pose = torch.concat(
             [
                 position.to(self.device, dtype=torch.float32) + self.scene.env_origins[env_ids],
-                rotation.to(self.device, dtype=torch.float32),
+                quat_to_sim(rotation.to(self.device, dtype=torch.float32)),
             ],
             dim=-1,
         )
@@ -1937,29 +2050,27 @@ class IsaacsimHandler(BaseSimHandler):
         if camera.mount_to is None:
             prim_path = f"/World/envs/env_.*/{camera.name}"
             # Use default offset, will be set by set_world_poses_from_view later
-            offset = CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world")
+            offset = CameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=quat_to_sim((1.0, 0.0, 0.0, 0.0)), convention="world")
         else:
             prim_path = f"/World/envs/env_.*/{camera.mount_to}/{camera.mount_link}/{camera.name}"
-            offset = CameraCfg.OffsetCfg(pos=camera.mount_pos, rot=camera.mount_quat, convention="world")
+            offset = CameraCfg.OffsetCfg(pos=camera.mount_pos, rot=quat_to_sim(camera.mount_quat), convention="world")
 
-        camera_inst = Camera(
-            CameraCfg(
-                prim_path=prim_path,
-                offset=offset,
-                data_types=[data_type_map[dt] for dt in camera.data_types],
-                spawn=sim_utils.PinholeCameraCfg(
-                    focal_length=camera.focal_length,
-                    focus_distance=camera.focus_distance,
-                    horizontal_aperture=camera.horizontal_aperture,
-                    clipping_range=camera.clipping_range,
-                ),
-                width=camera.width,
-                height=camera.height,
-                colorize_instance_segmentation=False,
-                colorize_instance_id_segmentation=False,
-            )
+        camera_cfg = CameraCfg(
+            prim_path=prim_path,
+            offset=offset,
+            data_types=[data_type_map[dt] for dt in camera.data_types],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=camera.focal_length,
+                focus_distance=camera.focus_distance,
+                horizontal_aperture=camera.horizontal_aperture,
+                clipping_range=camera.clipping_range,
+            ),
+            width=camera.width,
+            height=camera.height,
+            colorize_instance_segmentation=False,
+            colorize_instance_id_segmentation=False,
         )
-        self.scene.sensors[camera.name] = camera_inst
+        self._register_asset("sensors", camera.name, Camera, camera_cfg)
         log.debug(f"Added camera {camera.name} to scene with prim_path: {prim_path}")
 
     def refresh_render(self, passes: int = 2) -> None:
@@ -2023,7 +2134,7 @@ class IsaacsimHandler(BaseSimHandler):
 
             if self.sim is not None:
                 try:
-                    if self.sim.has_gui() or self.sim.has_rtx_sensors():
+                    if self._is_rendering():
                         self.sim.render()
                 except Exception as err:
                     log.debug(f"Sim render failed during {reason}: {err}")

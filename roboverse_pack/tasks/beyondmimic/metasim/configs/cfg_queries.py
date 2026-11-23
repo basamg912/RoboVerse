@@ -12,6 +12,7 @@ from collections import deque
 import torch
 
 from metasim.sim.base import BaseQueryType, BaseSimHandler
+from metasim.utils.isaaclab_compat import as_torch
 
 try:
     import isaacgym
@@ -60,7 +61,7 @@ class ContactForces(BaseQueryType):
                     self.handler.gym.acquire_net_contact_force_tensor(self.handler.sim)
                 )
             elif self.simulator == "isaacsim":
-                self._current_contact_force = self.handler.contact_sensor.data.net_forces_w
+                self._current_contact_force = as_torch(self.handler.contact_sensor.data.net_forces_w)
             elif self.simulator == "mujoco":
                 self._current_contact_force = self._get_contact_forces_mujoco()
             else:
@@ -81,7 +82,7 @@ class ContactForces(BaseQueryType):
         if self.simulator == "isaacgym":
             self.handler.gym.refresh_net_contact_force_tensor(self.handler.sim)
         elif self.simulator == "isaacsim":
-            self._current_contact_force = self.handler.contact_sensor.data.net_forces_w
+            self._current_contact_force = as_torch(self.handler.contact_sensor.data.net_forces_w)
         elif self.simulator == "mujoco":
             self._current_contact_force = self._get_contact_forces_mujoco()
         else:

@@ -16,6 +16,7 @@ import rootutils
 import torch
 import tyro
 from loguru import logger as log
+from rsl_rl.runners import OnPolicyRunner
 
 rootutils.setup_root(__file__, pythonpath=True)
 
@@ -106,42 +107,17 @@ def evaluate(args: RslRlPPOConfig):
     checkpoint_path = get_load_path(load_root=log_dir, checkpoint=checkpoint_num)
 
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
     print(f"Loaded training config from task: {task_cls.__name__}")
 
     # Create environment wrapper
     wrapped_env = RslRlEnvWrapper(env, train_cfg=args.train_cfg)
 
-    # Get observations from environment (needed for resolve_obs_groups)
-    from rsl_rl.modules import ActorCritic
-
-    obs = wrapped_env.get_observations()
-
-    obs_groups = args.obs_groups or {"policy": ["policy"], "critic": ["critic"]}
-
-    # Extract policy config
-    policy_cfg = args.policy
-
-    # Create actor-critic model with obs and obs_groups
-    actor_critic = ActorCritic(
-        obs=obs,
-        obs_groups=obs_groups,
-        num_actions=env.num_actions,
-        actor_hidden_dims=policy_cfg.actor_hidden_dims,
-        critic_hidden_dims=policy_cfg.critic_hidden_dims,
-        activation=policy_cfg.activation,
-        init_noise_std=policy_cfg.init_noise_std,
-    ).to(device)
-
-    state_dict = checkpoint["model_state_dict"]
-    state_dict = {k: v for k, v in state_dict.items() if "critic" not in k}
-    # Load the model weights
-    actor_critic.load_state_dict(state_dict, strict=False)
-    actor_critic.to(device)
-    actor_critic.eval()
-    # Create inference policy (just the actor part)
-    policy = actor_critic.act_inference
+    # Build the policy through the runner so the model classes and checkpoint layout match the installed
+    # rsl_rl: 3.x keeps one ``ActorCritic`` (``model_state_dict``), 4.x+ separate actor / critic models
+    # (``actor_state_dict``). ``train_cfg`` carries both config shapes (see RslRlPPOConfig).
+    runner = OnPolicyRunner(env=wrapped_env, train_cfg=args.train_cfg, log_dir=None, device=device)
+    runner.load(checkpoint_path)
+    policy = runner.get_inference_policy(device=device)
 
     # Disable curriculum and command resampling for eval
     env.cfg.curriculum.enabled = False

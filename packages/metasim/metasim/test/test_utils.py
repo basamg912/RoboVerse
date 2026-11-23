@@ -82,7 +82,11 @@ def isaacsim_context(request):
 
     if sim == "isaacsim":
         import isaaclab.sim as sim_utils
-        import isaacsim.core.utils.stage as stage_utils
+
+        try:  # Isaac Lab 3 owns the stage helpers; Isaac Sim 6.2 dropped isaacsim.core.utils
+            import isaaclab.sim.utils.stage as stage_utils
+        except ImportError:
+            import isaacsim.core.utils.stage as stage_utils
 
         log.debug("Creating new stage")
         stage_utils.create_new_stage()

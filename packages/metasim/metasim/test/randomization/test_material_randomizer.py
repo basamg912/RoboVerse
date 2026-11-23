@@ -14,6 +14,7 @@ from metasim.randomization.material_randomizer import (
     MaterialRandomCfg,
     MaterialRandomizer,
 )
+from metasim.utils.isaaclab_compat import get_current_stage, physx_view, view_to_torch
 
 
 def material_physical(handler, distribution="uniform", common_range=(1e-8, 1.0)):
@@ -134,10 +135,6 @@ def material_mdl(handler, distribution="uniform", common_range=(1e-8, 1.0)):
 
     # Before randomization, capture whether any material is bound (for info only)
     try:
-        try:
-            import omni.isaac.core.utils.prims as prim_utils  # type: ignore[import-not-found]
-        except ModuleNotFoundError:
-            import isaacsim.core.utils.prims as prim_utils  # type: ignore[import-not-found]
         from pxr import UsdShade  # type: ignore[import-not-found]
     except ImportError:
         # If simulation-specific modules are unavailable, skip MDL test gracefully.
@@ -150,7 +147,7 @@ def material_mdl(handler, distribution="uniform", common_range=(1e-8, 1.0)):
     bound_before: list = []
     for env_id in range(handler._num_envs):  # type: ignore[attr-defined]
         prim_path = prim_path_template.replace("env_.*", f"env_{env_id}")
-        prim = prim_utils.get_prim_at_path(prim_path)
+        prim = get_current_stage().GetPrimAtPath(prim_path)
         if prim is None:
             continue
         binding_api = UsdShade.MaterialBindingAPI(prim)
@@ -164,7 +161,7 @@ def material_mdl(handler, distribution="uniform", common_range=(1e-8, 1.0)):
     bound_after: list = []
     for env_id in range(handler._num_envs):  # type: ignore[attr-defined]
         prim_path = prim_path_template.replace("env_.*", f"env_{env_id}")
-        prim = prim_utils.get_prim_at_path(prim_path)
+        prim = get_current_stage().GetPrimAtPath(prim_path)
         if prim is None:
             continue
         binding_api = UsdShade.MaterialBindingAPI(prim)
@@ -337,7 +334,7 @@ def _get_object_instance(handler, obj_name):
 def _get_physical_properties(handler, obj_name):
     """Helper to get physical properties from object."""
     obj_inst = _get_object_instance(handler, obj_name)
-    materials = obj_inst.root_physx_view.get_material_properties()
+    materials = view_to_torch(physx_view(obj_inst).get_material_properties())
     # materials shape: [num_envs, num_bodies, 3] or [num_envs, 3]
     # index 0=static friction, 1=dynamic friction, 2=restitution
 
@@ -351,12 +348,6 @@ def _get_pbr_properties(randomizer: MaterialRandomizer) -> dict[str, Any]:
 
     try:
         import omni  # type: ignore[import-not-found]
-
-        try:
-            import omni.isaac.core.utils.prims as prim_utils  # type: ignore[import-not-found]
-        except ModuleNotFoundError:
-            import isaacsim.core.utils.prims as prim_utils  # type: ignore[import-not-found]
-
         from pxr import UsdShade  # type: ignore[import-not-found]
     except ImportError:
         return {}
@@ -376,7 +367,7 @@ def _get_pbr_properties(randomizer: MaterialRandomizer) -> dict[str, Any]:
             continue
 
         prim_path = obj_inst.cfg.prim_path.replace("env_.*", f"env_{env_id}")
-        prim = prim_utils.get_prim_at_path(prim_path)
+        prim = get_current_stage().GetPrimAtPath(prim_path)
         if prim is None:
             continue
 
